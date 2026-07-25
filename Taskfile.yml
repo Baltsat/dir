@@ -3,473 +3,62 @@
 
 version: "3"
 
-env:
-  GOWORK: off
-
-includes:
-  vars:
-    taskfile: Taskfile.vars.yml
-    flatten: true
-    excludes: [default]
-
-  api:
-    taskfile: proto/Taskfile.yml
-    flatten: true
-    excludes: [default]
-
-  cli:
-    taskfile: cli/Taskfile.yml
-    flatten: true
-    excludes: [default]
-
-  deps:
-    taskfile: Taskfile.deps.yml
-    dir: "{{.BIN_DIR}}"
-    flatten: true
-    excludes: [default]
-
-  e2e:
-    taskfile: tests/Taskfile.yml
-    flatten: true
-    excludes: [default]
-
-  helm:
-    taskfile: install/Taskfile.yml
-    flatten: true
-    excludes: [default]
-
-  server:
-    taskfile: server/Taskfile.yml
-    flatten: true
-    excludes: [default]
-
-  docs:
-    taskfile: docs/Taskfile.yml
-    excludes: [default]
-
-  ui:
-    taskfile: server/gateway/ui/Taskfile.yml
-    flatten: true
-    excludes: [default]
-
 tasks:
-  ##
-  ## General
-  ##
-  default:
-    cmds:
-      - task -l
-
-  gen:
-    desc: Generate code for all components
-    cmds:
-      - task: api:gen
-      - task: helm:gen
-
-  check:
-    desc: Checks for all code violations
-    cmds:
-      - task: lint
-      - task: license
-
-  build:
-    desc: Build images for all components
-    deps:
-      - task: deps:tidy
-      - task: gen
-    vars:
-      GOARCH: "{{ .GOARCH | default ARCH }}"
-      EXTRA_FLAGS: '{{ .EXTRA_FLAGS | default "" }}'
-    cmds:
-      # NOTE: Always build the images locally to include changes which are not commited
-      - |
-        # NOTE: CI env var is set by default on GitHub Actions
-        if [ "${CI}" != "true" ]; then
-          {{.BAKE_ENV}} docker buildx bake {{.IMAGE_BAKE_OPTS}} --set *.platform=linux/{{.GOARCH}} {{.EXTRA_FLAGS}}
-        else
-          images=$({{.BAKE_ENV}} docker buildx bake default --print | jq -r '.target | with_entries(.value |= .tags[0]) | to_entries[] | .value')
-
-          echo "$images" | while IFS= read -r image; do
-            if ! docker image inspect "$image" > /dev/null 2>&1; then
-              echo "Image missing: $image"
-              {{.BAKE_ENV}} docker buildx bake {{.IMAGE_BAKE_OPTS}} --set *.platform=linux/{{.GOARCH}} {{.EXTRA_FLAGS}}
-              exit 0 # NOTE: Exit as all bake target built, no need for more check
-            fi
-          done
-
-          echo "All images already exist locally. Skipping build."
-        fi
-
-  build:coverage:
-    desc: Build images for all components with coverage instrumentation
-    cmds:
-      - task: build
-        vars:
-          BAKE_ENV: "{{ .COVERAGE_BAKE_ENV }}"
-          # TODO: -coverpkg should be set to include all packages (server, api, utils) in the coverage report
-          # but it's not working as expected, so we're using the default coverage package for now
-          EXTRA_FLAGS: 'coverage --set *.args.BUILD_OPTS="-cover -covermode=atomic"'
-
-  build:all:
-    desc: Build images for all components for multiple platforms
-    cmds:
-      # TODO: make a platform variable and use build task to avoid duplication
-      # NOTE: Always build the images locally to include changes which are not commited
-      - |
-        # NOTE: CI env var is set by default on GitHub Actions
-        if [ "${CI}" != "true" ]; then
-          {{.BAKE_ENV}} docker buildx bake {{.IMAGE_BAKE_OPTS}} --set *.platform=linux/amd64,linux/arm64
-        else
-          images=$({{.BAKE_ENV}} docker buildx bake default --print | jq -r '.target | with_entries(.value |= .tags[0]) | to_entries[] | .value')
-
-          echo "$images" | while IFS= read -r image; do
-            if ! docker image inspect "$image" > /dev/null 2>&1; then
-              echo "Image missing: $image"
-              {{.BAKE_ENV}} docker buildx bake {{.IMAGE_BAKE_OPTS}} --set *.platform=linux/amd64,linux/arm64
-              exit 0 # NOTE: Exit as all bake target built, no need for more check
-            fi
-          done
-
-          echo "All images already exist locally. Skipping build."
-        fi
-
-  pull:
-    desc: Pull images for all components
-    cmds:
-      - |
-        images=$({{.BAKE_ENV}} docker buildx bake default --print | jq -r '.target | with_entries(.value |= .tags[0]) | to_entries[] | .value')
-        echo "$images" | while read image; do
-          echo "Pulling image: $image"
-          docker pull $image
-        done
-
-  push:
-    desc: Build and push images for all components
-    prompt:
-      - Are you sure you want to push the images to remote registry?
-    cmds:
-      - "{{.BAKE_ENV}} docker buildx bake {{.IMAGE_BAKE_OPTS}} --set=*.output=type=registry"
-
-  release:create:
-    desc: Prepare release
-    internal: true
-    deps:
-      - task: deps:multimod-bin
-    vars:
-      RELEASE_VERSION: "{{ .RELEASE_VERSION }}"
-    cmds:
-      # Switch to new branch
-      - 'if [ "$(git rev-parse --abbrev-ref HEAD)" != "release/{{.RELEASE_VERSION}}" ]; then git checkout -b release/{{.RELEASE_VERSION}}; fi'
-      # Update versions.yaml with the new version
-      - 'awk ''{gsub(/version: .*/,"version: {{.RELEASE_VERSION}}")}1'' versions.yaml > versions.yaml.tmp'
-      - "mv versions.yaml.tmp versions.yaml"
-      # Add release changes
-      - |
-        git add .
-        git commit -S --signoff -m "release(dir): prepare release {{.RELEASE_VERSION}}"
-      # Verify Go release
-      - |
-        {{ .MULTIMOD_BIN }} verify
-        {{ .MULTIMOD_BIN }} prerelease --all-module-sets --skip-go-mod-tidy=true --commit-to-different-branch=false
-      - |
-        git commit --amend -S --signoff -m "release(dir): prepare release {{.RELEASE_VERSION}}"
-      # Push prepared release
-      - task: release:push
-
-  release:create:api:
-    desc: Prepare api module set release without root artifacts
-    deps:
-      - task: deps:multimod-bin
-    vars:
-      RELEASE_VERSION: "{{ .RELEASE_VERSION }}"
-      RELEASE_BRANCH: "release/api/{{.RELEASE_VERSION}}"
-    cmds:
-      # Switch to new branch
-      - 'if [ "$(git rev-parse --abbrev-ref HEAD)" != "{{.RELEASE_BRANCH}}" ]; then git checkout -b {{.RELEASE_BRANCH}}; fi'
-      # Update only the api module set in versions.yaml with the new version
-      - task: release:update-module-set-version
-        vars:
-          RELEASE_MODULE_SET: api
-          RELEASE_VERSION: "{{.RELEASE_VERSION}}"
-      # Add release changes
-      - |
-        git add .
-        git commit -S --signoff -m "release(dir): prepare api release {{.RELEASE_VERSION}}"
-      # Verify Go release for the api module set only
-      - |
-        {{ .MULTIMOD_BIN }} prerelease --module-set-names api --skip-go-mod-tidy=true --commit-to-different-branch=false
-      - |
-        git commit --amend -S --signoff -m "release(dir): prepare api release {{.RELEASE_VERSION}}"
-      # Push prepared release
-      - task: release:push:branch
-        vars:
-          RELEASE_BRANCH: "{{.RELEASE_BRANCH}}"
-
-  release:create:server:
-    desc: Prepare server module set release for root artifacts
-    deps:
-      - task: deps:multimod-bin
-    vars:
-      RELEASE_VERSION: "{{ .RELEASE_VERSION }}"
-      RELEASE_BRANCH: "release/server/{{.RELEASE_VERSION}}"
-    cmds:
-      # Switch to new branch
-      - 'if [ "$(git rev-parse --abbrev-ref HEAD)" != "{{.RELEASE_BRANCH}}" ]; then git checkout -b {{.RELEASE_BRANCH}}; fi'
-      # Update only the server module set in versions.yaml with the new version
-      - task: release:update-module-set-version
-        vars:
-          RELEASE_MODULE_SET: server
-          RELEASE_VERSION: "{{.RELEASE_VERSION}}"
-      # Add release changes
-      - |
-        git add .
-        git commit -S --signoff -m "release(dir): prepare server release {{.RELEASE_VERSION}}"
-      # Verify Go release for the server module set only
-      - |
-        {{ .MULTIMOD_BIN }} prerelease --module-set-names server --skip-go-mod-tidy=true --commit-to-different-branch=false
-      - |
-        git commit --amend -S --signoff -m "release(dir): prepare server release {{.RELEASE_VERSION}}"
-      # Push prepared release
-      - task: release:push:branch
-        vars:
-          RELEASE_BRANCH: "{{.RELEASE_BRANCH}}"
-
-  release:push:branch:
-    internal: true
-    vars:
-      RELEASE_BRANCH: "{{ .RELEASE_BRANCH }}"
-    prompt:
-      - "Are you sure you want to push the release branch {{.RELEASE_BRANCH}} to remote repository?"
-    cmds:
-      - |
-        git push --set-upstream origin {{.RELEASE_BRANCH}} || true
-
-  release:update-module-set-version:
-    internal: true
-    deps:
-      - deps:yq
-    vars:
-      RELEASE_MODULE_SET: "{{ .RELEASE_MODULE_SET }}"
-      RELEASE_VERSION: "{{ .RELEASE_VERSION }}"
-    cmds:
-      - |
-        RELEASE_MODULE_SET="{{.RELEASE_MODULE_SET}}" \
-          {{.YQ_BIN}} -e '.["module-sets"] | has(strenv(RELEASE_MODULE_SET))' versions.yaml > /dev/null
-      - |
-        RELEASE_MODULE_SET="{{.RELEASE_MODULE_SET}}" \
-        RELEASE_VERSION="{{.RELEASE_VERSION}}" \
-          {{.YQ_BIN}} -i '.["module-sets"][strenv(RELEASE_MODULE_SET)].version = strenv(RELEASE_VERSION)' versions.yaml
-
-  release:push:
-    internal: true
-    vars:
-      RELEASE_VERSION: "{{ .RELEASE_VERSION }}"
-    prompt:
-      - "Are you sure you want to push the release branch release/{{.RELEASE_VERSION}} to remote repository?"
-    cmds:
-      - |
-        git push --set-upstream origin release/{{.RELEASE_VERSION}} || true
-
-  ##
-  ## Test
-  ##
-
-  test:unit:
-    desc: Run unit tests on codebase
-    aliases: [test]
-    env:
-      GOWORK: off
-    vars:
-      EXTRA_ARGS: '{{ .EXTRA_ARGS | default "" }}'
-    cmds:
-      - for: { var: GO_MODULES_UNIT_TEST }
-        cmd: |
-          echo "Running tests in {{.ITEM}}"
-          go -C {{.ITEM}} test ./... {{.EXTRA_ARGS}}
-
-  test:unit:coverage:
-    desc: Run all unit tests with coverage
-    cmds:
-      - cmd: |
-          echo "Removing existing reports in {{.COVERAGE_DIR}}/unit"
-          rm -rf {{.COVERAGE_DIR}}/unit/*
-        if: "[ -d {{.COVERAGE_DIR}}/unit ]"
-
-      - cmd: |
-          echo "Creating new coverage directory: {{.COVERAGE_DIR}}/unit"
-          mkdir -p {{.COVERAGE_DIR}}/unit
-        if: "[ ! -d {{.COVERAGE_DIR}}/unit ]"
-
-      - for: { var: GO_MODULES_UNIT_TEST }
-        # NOTE: CI does not need go test stdout, local uses separate command to show the report
-        cmd: |
-          {{if ne .OVERRIDEN_COVERAGE_MODULES ""}}
-            if ! echo {{.OVERRIDEN_COVERAGE_MODULES}} | grep -q $(echo "{{.ITEM}}" | sed 's/^\.\///g'); then
-              echo "Skipping module {{.ITEM}}"
-              exit 0; # NOTE: Skip module if not in the list
-            fi
-          {{end}}
-
-          path={{.ITEM}}
-          coverage_dir_path="${path%/*}"
-          mkdir -p {{.COVERAGE_DIR}}/unit/${coverage_dir_path}
-
-          echo "Running coverage tests in {{.ITEM}}"
-          go test -C {{.ITEM}} -covermode=atomic -coverprofile="{{.COVERAGE_DIR}}/unit/{{.ITEM}}.out" ./... > /dev/null
-
-  test:unit:coverage:local:
-    desc: Run all unit tests with coverage
-    vars:
-      COVERAGE_IGNORED_FILES: '\.pb\.go|mock_|tests|testdata' # NOTE: Need to keep sync with codecov.yml manually
-      SHOW_TOTAL_ONLY: '{{ .SHOW_TOTAL_ONLY | default "true" }}'
-    cmds:
-      - task: test:unit:coverage
-
-      - cmd: (test -f /tmp/total_report_results.txt && rm /tmp/total_report_results.txt) || true
-        if: '{{ eq .SHOW_TOTAL_ONLY "true" }}'
-
-      - for: { var: GO_MODULES_UNIT_TEST }
-        cmd: |
-          {{if ne .OVERRIDEN_COVERAGE_MODULES ""}}
-            if ! echo {{.OVERRIDEN_COVERAGE_MODULES}} | grep -q $(echo "{{.ITEM}}" | sed 's/^\.\///g'); then
-              echo "Skipping module {{.ITEM}} as it is not in the list of modules to cover"
-              exit 0; # NOTE: Skip module if not in the list
-            fi
-          {{end}}
-
-          echo "Filtering out ignored files from coverage for {{.ITEM}}"
-          grep -vE "{{.COVERAGE_IGNORED_FILES}}" {{.COVERAGE_DIR}}/unit/{{.ITEM}}.out > {{.COVERAGE_DIR}}/unit/{{.ITEM}}.out.tmp
-
-          mv {{.COVERAGE_DIR}}/unit/{{.ITEM}}.out.tmp {{.COVERAGE_DIR}}/unit/{{.ITEM}}.out
-
-          echo "Running go tool cover -func={{.COVERAGE_DIR}}/unit/{{.ITEM}}.out"
-          {{if eq .SHOW_TOTAL_ONLY "true"}}
-            go tool -C {{.ITEM}} cover -func={{.COVERAGE_DIR}}/unit/{{.ITEM}}.out | grep total | sed 's@total@{{.ITEM}} - total@g' >> /tmp/total_report_results.txt
-          {{else}}
-            go tool -C {{.ITEM}} cover -func={{.COVERAGE_DIR}}/unit/{{.ITEM}}.out
-          {{end}}
-
-      - cmd: |
-          cat /tmp/total_report_results.txt | column -t | sort
-          rm /tmp/total_report_results.txt
-        if: '{{ eq .SHOW_TOTAL_ONLY "true" }}'
-
-
-  ##
-  ## Linters
-  ##
-
-  pre-commit:golangci-lint:
-    desc: Run golangci-lint pre-commit hook
-    deps:
-      - task: deps:golangci-lint
-    vars:
-      FIX: "true"
-      REV: "HEAD"
-      # Override global GO_MODULES to include only changed
-      # modules based on files passed by pre-commit
-      GO_MODULES:
-        sh: |
-          # A space-separated list of file names, passed by pre-commit
-          # e.g. "server/controller/store.go tests/e2e/local/10_referrers_test.go"
-          go_files="{{.CLI_ARGS}}"
-          go_modules='{{.GO_MODULES | splitLines | join " " }}'
-
-          get_go_module() {
-            local go_file="$1"
-
-            result=""
-            length=0
-
-            for go_module in $go_modules; do
-              if [[ "./$go_file" == "$go_module"* ]]; then
-                if (( length < ${#go_module} )); then
-                  result="$go_module"
-                  length=${#go_module}
-                fi
-              fi
-            done
-
-            echo "$result"
-          }
-
-          result=()
-
-          for go_file in $go_files; do
-            # The file's module, e.g. "server", "tests"
-            go_module=$(get_go_module "$go_file")
-            [ -n "$go_module" ] && result+=("$go_module")
-          done
-
-          # sort -u to remove duplicates
-          result=($(printf "%s\n" "${result[@]}" | sort -u))
-
-          echo "${result[@]}"
-    cmds:
-      # One shell loop so only one golangci-lint runs at a time (global lock).
-      - |
-        set -euo pipefail
-        modules="{{ .GO_MODULES }}"
-        [ -z "$modules" ] && exit 0
-        for m in $modules; do
-          echo "Running golangci-lint in $m"
-          (cd "$m" && {{ .GOLANGCI_LINT_BIN }} run --config {{ .ROOT_DIR }}/.golangci.yml{{if eq .FIX "true"}} --fix{{end}} --new-from-rev="{{ .REV }}")
-        done
-
-  lint:go:
-    desc: Run Golang linters
-    vars:
-      GO_MODULES: "{{ .GO_MODULES }}"
-      FIX: '{{ .FIX | default "" }}'
-      REV: '{{ .REV | default "" }}'
-    deps:
-      - task: deps:golangci-lint
-    cmds:
-      - task: lint:go:modules
-        vars:
-          GO_MODULES: "{{ .GO_MODULES }}"
-          FIX: "{{ .FIX }}"
-          REV: "{{ .REV }}"
-
-  lint:go:modules:
-    desc: Run golangci-lint for each module sequentially (single process; global lock)
-    internal: true
-    cmds:
-      - |
-        set -euo pipefail
-        modules="{{ .GO_MODULES }}"
-        [ -z "$modules" ] && exit 0
-        for m in $modules; do
-          echo "Running golangci-lint in $m"
-          (cd "$m" && {{ .GOLANGCI_LINT_BIN }} run --config {{ .ROOT_DIR }}/.golangci.yml{{if eq .FIX "true"}} --fix{{end}} --new-from-rev="{{ .REV }}")
-        done
-
-  lint:buf:
-    desc: Run Buf linters
-    deps:
-      - task: deps:protoc
-      - task: deps:bufbuild
-    dir: ./proto
-    cmds:
-      - "{{.BUFBUILD_BIN}} lint"
-
-  lint:helm:
-    desc: Run Helm linters
-    deps:
-      - task: deps:helm
-    vars:
-      HELM_CHARTS:
-        sh: find ./install/charts -maxdepth 1 -mindepth 1 -type d -exec basename {} \;
-    cmds:
-      - for: { var: HELM_CHARTS }
-        cmd: |
-          echo "Running helm lint on {{.ITEM}}"
-          {{.HELM_BIN}} dependency update ./install/charts/{{.ITEM}}
-          {{.HELM_BIN}} lint ./install/charts/{{.ITEM}} --with-subcharts
-
   lint:
-    desc: Run all linters
-    deps:
-      - lint:go
-      - lint:buf
-      - lint:helm
+    desc: Create the clean DCO-correct replacement branch for issue 1886
+    cmds:
+      - |
+        set -euo pipefail
+
+        test "${GITHUB_REPOSITORY:-}" = "Baltsat/dir"
+
+        git fetch origin main fix/1886-mapdatastore-concurrency
+
+        upstream_main_sha="$(git rev-parse origin/main)"
+        expected_upstream_sha="4f1ec1af810ee98caa2224083c75a16b932bc279"
+
+        if [ "$upstream_main_sha" != "$expected_upstream_sha" ]; then
+          echo "fork main no longer matches verified upstream main: $upstream_main_sha" >&2
+          exit 1
+        fi
+
+        target_ref="refs/heads/fix/1886-mapdatastore-concurrency-dco"
+        if git ls-remote --exit-code --heads origin "$target_ref" >/dev/null 2>&1; then
+          echo "target branch already exists; refusing to overwrite" >&2
+          exit 1
+        fi
+
+        workdir="$(mktemp -d)"
+        trap 'git worktree remove --force "$workdir" >/dev/null 2>&1 || true' EXIT
+
+        git worktree add --detach "$workdir" origin/main
+        cd "$workdir"
+        git switch -c fix/1886-mapdatastore-concurrency-dco
+        git checkout origin/fix/1886-mapdatastore-concurrency -- \
+          server/datastore/datastore.go \
+          server/datastore/datastore_test.go
+
+        changed_files="$(git diff --name-only)"
+        expected_files=$'server/datastore/datastore.go\nserver/datastore/datastore_test.go'
+        if [ "$changed_files" != "$expected_files" ]; then
+          printf 'unexpected files:\n%s\n' "$changed_files" >&2
+          exit 1
+        fi
+
+        git config user.name "Konstantin Baltsat"
+        git config user.email "konstantin.baltsat@edu.esiee.fr"
+
+        GIT_AUTHOR_NAME="Konstantin Baltsat" \
+        GIT_AUTHOR_EMAIL="konstantin.baltsat@edu.esiee.fr" \
+        GIT_COMMITTER_NAME="Konstantin Baltsat" \
+        GIT_COMMITTER_EMAIL="konstantin.baltsat@edu.esiee.fr" \
+          git commit \
+            -m "fix(datastore): synchronize in-memory access" \
+            -m "Signed-off-by: Konstantin Baltsat <konstantin.baltsat@edu.esiee.fr>"
+
+        echo "--- created commit metadata ---"
+        git show -s --format='commit=%H%nauthor-name=%an%nauthor-email=%ae%ncommitter-name=%cn%ncommitter-email=%ce%nmessage=%B' HEAD
+        echo "--- changed files ---"
+        git diff --name-status origin/main...HEAD
+
+        git push origin HEAD:"$target_ref"
