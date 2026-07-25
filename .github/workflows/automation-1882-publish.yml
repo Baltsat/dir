@@ -1,7 +1,7 @@
 # Copyright AGNTCY Contributors (https://github.com/agntcy)
 # SPDX-License-Identifier: Apache-2.0
 
-name: Capture issue 1882 tidy output
+name: Capture issue 1882 tidy artifact
 
 on:
   push:
@@ -9,16 +9,15 @@ on:
       - "automation/1882-publish"
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  capture-tidy-output:
+  capture-tidy-artifact:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout exact upstream base
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
-          fetch-depth: 0
           ref: 4f1ec1af810ee98caa2224083c75a16b932bc279
 
       - name: Setup Go
@@ -27,13 +26,8 @@ jobs:
           go-version: "1.26.5"
           cache-dependency-path: "client/go.sum"
 
-      - name: Apply dependency promotion, tidy, and publish disposable output
+      - name: Produce exact tidied module metadata
         shell: bash
-        env:
-          GIT_AUTHOR_NAME: Konstantin Baltsat
-          GIT_AUTHOR_EMAIL: konstantin.baltsat@edu.esiee.fr
-          GIT_COMMITTER_NAME: Konstantin Baltsat
-          GIT_COMMITTER_EMAIL: konstantin.baltsat@edu.esiee.fr
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -56,16 +50,19 @@ jobs:
           PY
 
           GOWORK=off go -C client mod tidy -go=1.26.5
-          git config user.name "$GIT_AUTHOR_NAME"
-          git config user.email "$GIT_AUTHOR_EMAIL"
-          git add client/go.mod client/go.sum
-          if git diff --cached --quiet; then
-            echo "go mod tidy produced no metadata change"
-          else
-            git commit --signoff -m "chore: capture issue 1882 tidy output"
-          fi
-          test "$(git show -s --format=%an HEAD)" = "$GIT_AUTHOR_NAME"
-          test "$(git show -s --format=%ae HEAD)" = "$GIT_AUTHOR_EMAIL"
-          test "$(git show -s --format=%cn HEAD)" = "$GIT_COMMITTER_NAME"
-          test "$(git show -s --format=%ce HEAD)" = "$GIT_COMMITTER_EMAIL"
-          git push --force origin HEAD:refs/heads/automation/1882-tidy-output
+          mkdir -p /tmp/issue1882-tidy/client
+          cp client/go.mod /tmp/issue1882-tidy/client/go.mod
+          cp client/go.sum /tmp/issue1882-tidy/client/go.sum
+          {
+            echo "go=$(go version)"
+            echo "go.mod=$(git hash-object client/go.mod)"
+            echo "go.sum=$(git hash-object client/go.sum)"
+          } > /tmp/issue1882-tidy/metadata.txt
+
+      - name: Upload exact tidied metadata
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: issue-1882-tidy-metadata
+          path: /tmp/issue1882-tidy
+          retention-days: 1
