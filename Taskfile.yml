@@ -12,15 +12,16 @@ tasks:
 
         test "${GITHUB_REPOSITORY:-}" = "Baltsat/dir"
 
-        git fetch origin main fix/1886-mapdatastore-concurrency
+        git fetch origin main verify/1886-dco-identity
 
         upstream_main_sha="$(git rev-parse origin/main)"
         expected_upstream_sha="4f1ec1af810ee98caa2224083c75a16b932bc279"
+        test "$upstream_main_sha" = "$expected_upstream_sha"
 
-        if [ "$upstream_main_sha" != "$expected_upstream_sha" ]; then
-          echo "fork main no longer matches verified upstream main: $upstream_main_sha" >&2
-          exit 1
-        fi
+        source_commit="53934cfdf303c84f7d523184803101aee3c2ef27"
+        source_tree="$(git rev-parse "${source_commit}^{tree}")"
+        expected_tree="bd08a3ee89d1f41e9c424c08c5ffcc680bc0b85c"
+        test "$source_tree" = "$expected_tree"
 
         target_ref="refs/heads/fix/1886-mapdatastore-concurrency-dco"
         if git ls-remote --exit-code --heads origin "$target_ref" >/dev/null 2>&1; then
@@ -28,37 +29,26 @@ tasks:
           exit 1
         fi
 
-        workdir="$(mktemp -d)"
-        trap 'git worktree remove --force "$workdir" >/dev/null 2>&1 || true' EXIT
+        commit_message="$(cat <<'EOF'
+        fix(datastore): synchronize in-memory access
 
-        git worktree add --detach "$workdir" origin/main
-        cd "$workdir"
-        git switch -c fix/1886-mapdatastore-concurrency-dco
-        git checkout origin/fix/1886-mapdatastore-concurrency -- \
-          server/datastore/datastore.go \
-          server/datastore/datastore_test.go
+        Signed-off-by: Konstantin Baltsat <konstantin.baltsat@edu.esiee.fr>
+        EOF
+        )"
 
-        changed_files="$(git diff --name-only)"
-        expected_files=$'server/datastore/datastore.go\nserver/datastore/datastore_test.go'
-        if [ "$changed_files" != "$expected_files" ]; then
-          printf 'unexpected files:\n%s\n' "$changed_files" >&2
-          exit 1
-        fi
-
-        git config user.name "Konstantin Baltsat"
-        git config user.email "konstantin.baltsat@edu.esiee.fr"
-
-        GIT_AUTHOR_NAME="Konstantin Baltsat" \
-        GIT_AUTHOR_EMAIL="konstantin.baltsat@edu.esiee.fr" \
-        GIT_COMMITTER_NAME="Konstantin Baltsat" \
-        GIT_COMMITTER_EMAIL="konstantin.baltsat@edu.esiee.fr" \
-          git commit \
-            -m "fix(datastore): synchronize in-memory access" \
-            -m "Signed-off-by: Konstantin Baltsat <konstantin.baltsat@edu.esiee.fr>"
+        new_commit="$(
+          printf '%s\n' "$commit_message" |
+            GIT_AUTHOR_NAME="Konstantin Baltsat" \
+            GIT_AUTHOR_EMAIL="konstantin.baltsat@edu.esiee.fr" \
+            GIT_COMMITTER_NAME="Konstantin Baltsat" \
+            GIT_COMMITTER_EMAIL="konstantin.baltsat@edu.esiee.fr" \
+              git commit-tree "$source_tree" -p "$upstream_main_sha"
+        )"
 
         echo "--- created commit metadata ---"
-        git show -s --format='commit=%H%nauthor-name=%an%nauthor-email=%ae%ncommitter-name=%cn%ncommitter-email=%ce%nmessage=%B' HEAD
-        echo "--- changed files ---"
-        git diff --name-status origin/main...HEAD
+        git show -s --format='commit=%H%nauthor-name=%an%nauthor-email=%ae%ncommitter-name=%cn%ncommitter-email=%ce%nmessage=%B' "$new_commit"
+        echo "--- created commit tree and parent ---"
+        git rev-parse "${new_commit}^{tree}"
+        git rev-parse "${new_commit}^"
 
-        git push origin HEAD:"$target_ref"
+        git push origin "$new_commit:$target_ref"
