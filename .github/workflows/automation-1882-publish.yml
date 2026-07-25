@@ -1,7 +1,7 @@
 # Copyright AGNTCY Contributors (https://github.com/agntcy)
 # SPDX-License-Identifier: Apache-2.0
 
-name: Capture issue 1882 tidy artifact
+name: Capture complete issue 1882 tidy artifact
 
 on:
   push:
@@ -12,7 +12,7 @@ permissions:
   contents: read
 
 jobs:
-  capture-tidy-artifact:
+  capture-complete-tidy-artifact:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout exact upstream base
@@ -26,10 +26,58 @@ jobs:
           go-version: "1.26.5"
           cache-dependency-path: "client/go.sum"
 
-      - name: Produce exact tidied module metadata
+      - name: Produce exact tidied complete patch metadata
         shell: bash
         run: |
           set -euo pipefail
+
+          cat > client/utils/cosign/kms_providers.go <<'EOF_GO'
+          // Copyright AGNTCY Contributors (https://github.com/agntcy)
+          // SPDX-License-Identifier: Apache-2.0
+
+          package cosign
+
+          // Register the same KMS providers as the Cosign CLI.
+          import (
+          	_ "github.com/sigstore/sigstore/pkg/signature/kms/aws"
+          	_ "github.com/sigstore/sigstore/pkg/signature/kms/azure"
+          	_ "github.com/sigstore/sigstore/pkg/signature/kms/gcp"
+          	_ "github.com/sigstore/sigstore/pkg/signature/kms/hashivault"
+          )
+          EOF_GO
+
+          cat > client/utils/cosign/kms_providers_test.go <<'EOF_TEST'
+          // Copyright AGNTCY Contributors (https://github.com/agntcy)
+          // SPDX-License-Identifier: Apache-2.0
+
+          package cosign
+
+          import (
+          	"slices"
+          	"testing"
+
+          	"github.com/sigstore/sigstore/pkg/signature/kms"
+          )
+
+          func TestKMSProvidersRegistered(t *testing.T) {
+          	t.Parallel()
+
+          	providers := kms.SupportedProviders()
+          	slices.Sort(providers)
+
+          	for _, expected := range []string{
+          		"awskms://",
+          		"azurekms://",
+          		"gcpkms://",
+          		"hashivault://",
+          	} {
+          		if !slices.Contains(providers, expected) {
+          			t.Errorf("registered KMS providers = %v, want %q", providers, expected)
+          		}
+          	}
+          }
+          EOF_TEST
+
           python3 - <<'PY'
           from pathlib import Path
 
@@ -49,20 +97,25 @@ jobs:
           path.write_text(text.replace(needle, needle + dependencies))
           PY
 
+          gofmt -w client/utils/cosign/kms_providers.go client/utils/cosign/kms_providers_test.go
           GOWORK=off go -C client mod tidy -go=1.26.5
-          mkdir -p /tmp/issue1882-tidy/client
+          mkdir -p /tmp/issue1882-tidy/client/utils/cosign
           cp client/go.mod /tmp/issue1882-tidy/client/go.mod
           cp client/go.sum /tmp/issue1882-tidy/client/go.sum
+          cp client/utils/cosign/kms_providers.go /tmp/issue1882-tidy/client/utils/cosign/kms_providers.go
+          cp client/utils/cosign/kms_providers_test.go /tmp/issue1882-tidy/client/utils/cosign/kms_providers_test.go
           {
             echo "go=$(go version)"
             echo "go.mod=$(git hash-object client/go.mod)"
             echo "go.sum=$(git hash-object client/go.sum)"
+            echo "kms_providers.go=$(git hash-object client/utils/cosign/kms_providers.go)"
+            echo "kms_providers_test.go=$(git hash-object client/utils/cosign/kms_providers_test.go)"
           } > /tmp/issue1882-tidy/metadata.txt
 
-      - name: Upload exact tidied metadata
+      - name: Upload exact complete tidied patch
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: issue-1882-tidy-metadata
+          name: issue-1882-complete-tidy-patch
           path: /tmp/issue1882-tidy
           retention-days: 1
