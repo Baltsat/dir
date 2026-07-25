@@ -1,7 +1,7 @@
 # Copyright AGNTCY Contributors (https://github.com/agntcy)
 # SPDX-License-Identifier: Apache-2.0
 
-name: Capture complete issue 1882 tidy artifact
+name: Validate and publish issue 1882 fix
 
 on:
   push:
@@ -9,15 +9,16 @@ on:
       - "automation/1882-publish"
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  capture-complete-tidy-artifact:
+  validate-and-publish:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout exact upstream base
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
+          fetch-depth: 0
           ref: 4f1ec1af810ee98caa2224083c75a16b932bc279
 
       - name: Setup Go
@@ -26,7 +27,10 @@ jobs:
           go-version: "1.26.5"
           cache-dependency-path: "client/go.sum"
 
-      - name: Produce exact tidied complete patch metadata
+      - name: Install Task
+        uses: go-task/setup-task@01a4adf9db2d14c1de7a560f09170b6e0df736aa # v2.1.0
+
+      - name: Apply minimal provider-registration patch
         shell: bash
         run: |
           set -euo pipefail
@@ -99,23 +103,68 @@ jobs:
 
           gofmt -w client/utils/cosign/kms_providers.go client/utils/cosign/kms_providers_test.go
           GOWORK=off go -C client mod tidy -go=1.26.5
-          mkdir -p /tmp/issue1882-tidy/client/utils/cosign
-          cp client/go.mod /tmp/issue1882-tidy/client/go.mod
-          cp client/go.sum /tmp/issue1882-tidy/client/go.sum
-          cp client/utils/cosign/kms_providers.go /tmp/issue1882-tidy/client/utils/cosign/kms_providers.go
-          cp client/utils/cosign/kms_providers_test.go /tmp/issue1882-tidy/client/utils/cosign/kms_providers_test.go
-          {
-            echo "go=$(go version)"
-            echo "go.mod=$(git hash-object client/go.mod)"
-            echo "go.sum=$(git hash-object client/go.sum)"
-            echo "kms_providers.go=$(git hash-object client/utils/cosign/kms_providers.go)"
-            echo "kms_providers_test.go=$(git hash-object client/utils/cosign/kms_providers_test.go)"
-          } > /tmp/issue1882-tidy/metadata.txt
+          test "$(git hash-object client/go.mod)" = 9e2bc533e1748c2a244ff0560018a60ecce3477b
+          test "$(git hash-object client/go.sum)" = 7297f73d5d67899a2e67a3f542a96348daafc906
+          test "$(git hash-object client/utils/cosign/kms_providers.go)" = 67e48ff3b38091bcbd82034aabc24b9869871675
+          test "$(git hash-object client/utils/cosign/kms_providers_test.go)" = b2a6f617c02b3bfd208487da6400c25510d54b94
+          git diff --check
+          test -z "$(gofmt -l client/utils/cosign/kms_providers.go client/utils/cosign/kms_providers_test.go)"
 
-      - name: Upload exact complete tidied patch
-        if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: issue-1882-complete-tidy-patch
-          path: /tmp/issue1882-tidy
-          retention-days: 1
+      - name: Verify module metadata is stable
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp client/go.mod /tmp/client.go.mod.before
+          cp client/go.sum /tmp/client.go.sum.before
+          GOWORK=off go -C client mod tidy -go=1.26.5
+          cmp /tmp/client.go.mod.before client/go.mod
+          cmp /tmp/client.go.sum.before client/go.sum
+
+      - name: Run focused deterministic tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          GOWORK=off go -C client test ./utils/cosign -run '^TestKMSProvidersRegistered$' -count=100
+          GOWORK=off go -C client test -race ./utils/cosign -run '^TestKMSProvidersRegistered$' -count=1
+          GOWORK=off go -C client vet ./utils/cosign
+
+      - name: Run client module checks
+        shell: bash
+        run: |
+          set -euo pipefail
+          GOWORK=off go -C client test ./...
+          GOWORK=off go -C client vet ./...
+
+      - name: Run client module lint
+        shell: bash
+        run: |
+          set -euo pipefail
+          task deps:golangci-lint
+          (cd client && ../.bin/golangci-lint-2.11.3 run --config ../.golangci.yml ./...)
+
+      - name: Create exact-identity commit and publish final branch
+        shell: bash
+        env:
+          GIT_AUTHOR_NAME: Konstantin Baltsat
+          GIT_AUTHOR_EMAIL: konstantin.baltsat@edu.esiee.fr
+          GIT_COMMITTER_NAME: Konstantin Baltsat
+          GIT_COMMITTER_EMAIL: konstantin.baltsat@edu.esiee.fr
+        run: |
+          set -euo pipefail
+          git config user.name "$GIT_AUTHOR_NAME"
+          git config user.email "$GIT_AUTHOR_EMAIL"
+          git add client/go.mod client/go.sum client/utils/cosign/kms_providers.go client/utils/cosign/kms_providers_test.go
+          test "$(git diff --cached --name-only | sort)" = $'client/go.mod\nclient/go.sum\nclient/utils/cosign/kms_providers.go\nclient/utils/cosign/kms_providers_test.go'
+          git diff --cached --check
+          git commit --signoff -m "fix(cosign): register cloud KMS providers"
+          test "$(git rev-parse HEAD^)" = 4f1ec1af810ee98caa2224083c75a16b932bc279
+          test "$(git show -s --format=%an HEAD)" = "$GIT_AUTHOR_NAME"
+          test "$(git show -s --format=%ae HEAD)" = "$GIT_AUTHOR_EMAIL"
+          test "$(git show -s --format=%cn HEAD)" = "$GIT_COMMITTER_NAME"
+          test "$(git show -s --format=%ce HEAD)" = "$GIT_COMMITTER_EMAIL"
+          git show -s --format=%B HEAD | grep -Fx "Signed-off-by: Konstantin Baltsat <konstantin.baltsat@edu.esiee.fr>"
+          test "$(git show HEAD:client/go.mod | git hash-object --stdin)" = 9e2bc533e1748c2a244ff0560018a60ecce3477b
+          test "$(git show HEAD:client/go.sum | git hash-object --stdin)" = 7297f73d5d67899a2e67a3f542a96348daafc906
+          test "$(git show HEAD:client/utils/cosign/kms_providers.go | git hash-object --stdin)" = 67e48ff3b38091bcbd82034aabc24b9869871675
+          test "$(git show HEAD:client/utils/cosign/kms_providers_test.go | git hash-object --stdin)" = b2a6f617c02b3bfd208487da6400c25510d54b94
+          git push --force-with-lease=refs/heads/fix/1882-cloud-kms-providers:4f1ec1af810ee98caa2224083c75a16b932bc279 origin HEAD:refs/heads/fix/1882-cloud-kms-providers
